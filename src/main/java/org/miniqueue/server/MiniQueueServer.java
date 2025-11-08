@@ -80,6 +80,7 @@ public class MiniQueueServer implements AutoCloseable {
         // This information is stored in miniqueue.checkpoint file. This file gets updated at everytime we
         // flush the inmemory cache to the checkpoint file. See flushCacheToDataFile() for details.
         flushedOffsets = checkpointManager.loadCheckpoint();
+        seedPartitionOffsetsFromCheckpoint(flushedOffsets);
         recoverFromWal(flushedOffsets);
         asyncWalWriter = new AsyncWalWriter(walManager, WAL_MAX_BATCH_SIZE, WAL_FLUSH_INTERVAL_MS);
 
@@ -119,6 +120,16 @@ public class MiniQueueServer implements AutoCloseable {
 
 
     }
+
+    private void seedPartitionOffsetsFromCheckpoint(Map<Short, Long> flushedOffsets) {
+        for (Map.Entry<Short, Long> entry : flushedOffsets.entrySet()) {
+            short partitionId = entry.getKey();
+            long lastFlushedOffset = entry.getValue();
+            partitionOffsets.merge(partitionId, lastFlushedOffset + 1,
+                                   (current, candidate) -> Math.max(current, candidate));
+        }
+    }
+
 
     /**
      *  When the server starts it will try to recover from WAL if some events have not yet been flushed to data
@@ -171,7 +182,8 @@ public class MiniQueueServer implements AutoCloseable {
                 // Update the partition offset to the latest recovered offset
                 if (!recordsToRecover.isEmpty()) {
                     long lastOffset = recordsToRecover.get(recordsToRecover.size() - 1).getOffset();
-                    partitionOffsets.put(partitionId, lastOffset);
+                    long nextOffset = lastOffset + 1;
+                    partitionOffsets.merge(partitionId, nextOffset, (current, candidate) -> Math.max(current, candidate));
                 }
             } finally {
                 writeLock.unlock();
