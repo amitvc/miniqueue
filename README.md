@@ -129,6 +129,10 @@ data files. That ensures entries written up in WAL are now in the data pages as 
 
 Some performance numbers;
 
+Running the tests:
+java -cp target/miniqueue-1.0-SNAPSHOT-jar-with-dependencies.jar org.miniqueue.server.PerfTest // Produce perf test
+java -cp target/miniqueue-1.0-SNAPSHOT-jar-with-dependencies.jar org.miniqueue.server.FetchPerfTest  // Fetch perf test
+
 Produce test harness:
 --- MiniQueue Performance Test ---
 Configuration: 10 Threads, 300000 Messages/Thread
