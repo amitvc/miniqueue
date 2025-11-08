@@ -8,6 +8,8 @@ import static org.miniqueue.util.Config.FLUSH_INTERVAL_MS;
 import static org.miniqueue.util.Config.MAX_PARTITION_ID;
 import static org.miniqueue.util.Config.MAX_WAL_SEGMENT_SIZE;
 import static org.miniqueue.util.Config.WAL_FILE_NAME;
+import static org.miniqueue.util.Config.WAL_FLUSH_INTERVAL_MS;
+import static org.miniqueue.util.Config.WAL_MAX_BATCH_SIZE;
 
 import com.codahale.metrics.ConsoleReporter;
 import com.codahale.metrics.Counter;
@@ -25,11 +27,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 import org.miniqueue.api.AdminHandler;
 import org.miniqueue.api.FetchHandler;
 import org.miniqueue.api.ProduceHandler;
+import org.miniqueue.storage.AsyncWalWriter;
 import org.miniqueue.storage.CheckpointManager;
 import org.miniqueue.storage.Event;
 import org.miniqueue.storage.LocalDiskEventStorage;
@@ -42,6 +46,7 @@ public class MiniQueueServer implements AutoCloseable {
     private final HttpServer server;
     private final WalManager walManager;
     private final LocalDiskEventStorage localDiskEventStorage;
+    private final AsyncWalWriter asyncWalWriter;
     private final ScheduledExecutorService flusherThread;
     private final ScheduledExecutorService compactorThread;
     private final CheckpointManager checkpointManager;
@@ -52,7 +57,7 @@ public class MiniQueueServer implements AutoCloseable {
 
 
     // In-memory state
-    private final Map<Short, ReentrantLock> partitionLocks = new ConcurrentHashMap<>();
+    private final Map<Short, ReadWriteLock> partitionLocks = new ConcurrentHashMap<>();
     private final Map<Short, List<Record>> inMemoryCache = new ConcurrentHashMap<>();
 
     // The current offset of each partition. This does not mean the offset is committed to the data pages yet.
@@ -76,12 +81,13 @@ public class MiniQueueServer implements AutoCloseable {
         // flush the inmemory cache to the checkpoint file. See flushCacheToDataFile() for details.
         flushedOffsets = checkpointManager.loadCheckpoint();
         recoverFromWal(flushedOffsets);
+        asyncWalWriter = new AsyncWalWriter(walManager, WAL_MAX_BATCH_SIZE, WAL_FLUSH_INTERVAL_MS);
 
 
         // Setup the http endpoints.
         // In a production service I would use something like netty or spring/boot to setup API endpoints.
         // Keeping dependencies to minimum.
-        server.createContext("/produce/", new ProduceHandler(partitionLocks, inMemoryCache, partitionOffsets, walManager, metrics));
+        server.createContext("/produce/", new ProduceHandler(partitionLocks, inMemoryCache, partitionOffsets, asyncWalWriter, metrics));
         server.createContext("/fetch/", new FetchHandler(localDiskEventStorage, partitionLocks, inMemoryCache, metrics));
         server.createContext("/admin/", new AdminHandler(localDiskEventStorage));
 
@@ -151,8 +157,9 @@ public class MiniQueueServer implements AutoCloseable {
             recordsToRecover.sort(java.util.Comparator.comparingLong(WalRecord::getOffset));
 
             // Get the lock for the partition
-            Lock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantLock());
-            lock.lock();
+            ReadWriteLock partitionLock = getPartitionLock(partitionId);
+            Lock writeLock = partitionLock.writeLock();
+            writeLock.lock();
             try {
                 // Add to in-memory cache
                 List<Record> partitionCache = inMemoryCache.computeIfAbsent(partitionId, k -> new ArrayList<>());
@@ -167,7 +174,7 @@ public class MiniQueueServer implements AutoCloseable {
                     partitionOffsets.put(partitionId, lastOffset);
                 }
             } finally {
-                lock.unlock();
+                writeLock.unlock();
             }
         }
 
@@ -180,8 +187,9 @@ public class MiniQueueServer implements AutoCloseable {
         Map<Short, Long> newFlushedOffsets = new HashMap<>();
 
         for (short partitionId = 0; partitionId <= MAX_PARTITION_ID; partitionId++) {
-            Lock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantLock());
-            lock.lock();
+            ReadWriteLock partitionLock = getPartitionLock(partitionId);
+            Lock writeLock = partitionLock.writeLock();
+            writeLock.lock();
             try {
                 List<Record> entries = inMemoryCache.get(partitionId);
                 if (entries != null && !entries.isEmpty()) {
@@ -195,7 +203,7 @@ public class MiniQueueServer implements AutoCloseable {
                     newFlushedOffsets.put(partitionId, maxOffset);
                 }
             } finally {
-                lock.unlock();
+                writeLock.unlock();
             }
         }
 
@@ -272,9 +280,14 @@ public class MiniQueueServer implements AutoCloseable {
         } catch (InterruptedException e) {
             System.err.println("Background threads did not shut down cleanly.");
         }
+        asyncWalWriter.close();
         walManager.close();
         localDiskEventStorage.close();
         System.out.println("Server shut down.");
+    }
+
+    private ReadWriteLock getPartitionLock(short partitionId) {
+        return partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantReadWriteLock(true));
     }
 
 }

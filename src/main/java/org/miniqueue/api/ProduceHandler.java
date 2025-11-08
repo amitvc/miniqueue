@@ -12,9 +12,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import org.miniqueue.storage.AsyncWalWriter;
 import org.miniqueue.storage.Record;
-import org.miniqueue.storage.WalManager;
 import org.miniqueue.storage.WalRecord;
 
 /**
@@ -22,20 +23,20 @@ import org.miniqueue.storage.WalRecord;
  */
 public class ProduceHandler extends MiniQueueApi {
 
-    private final Map<Short, ReentrantLock> partitionLocks;
+    private final Map<Short, ReadWriteLock> partitionLocks;
     private final Map<Short, List<Record>> inMemoryCache;
-    private final WalManager walManager;
+    private final AsyncWalWriter walWriter;
     private final Map<Short, Long> partitionOffsets;
     private final Counter produceRequests;
     private final Timer timer;
 
-    public ProduceHandler(Map<Short, ReentrantLock> partitionLocks,
+    public ProduceHandler(Map<Short, ReadWriteLock> partitionLocks,
                           Map<Short, List<Record>> inMemoryCache,
                           Map<Short, Long> partitionOffsets,
-                          WalManager walManager, MetricRegistry metrics) {
+                          AsyncWalWriter walWriter, MetricRegistry metrics) {
         this.partitionLocks = partitionLocks;
         this.inMemoryCache = inMemoryCache;
-        this.walManager = walManager;
+        this.walWriter = walWriter;
         this.partitionOffsets = partitionOffsets;
         produceRequests = metrics.counter("produce-requests");
         timer = metrics.timer("produce-handler");
@@ -75,8 +76,9 @@ public class ProduceHandler extends MiniQueueApi {
             sendResponse(exchange, 400, "Bad Request: " + e.getMessage());
             return;
         }
-        final Lock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantLock());
-        lock.lock();
+        final ReadWriteLock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantReadWriteLock(true));
+        final Lock writeLock = lock.writeLock();
+        writeLock.lock();
         try {
             /**
              *  Step 1 : Get the partitional offset
@@ -88,7 +90,7 @@ public class ProduceHandler extends MiniQueueApi {
             WalRecord entry = new WalRecord(partitionId, offset, key.getBytes(StandardCharsets.UTF_8),
                                             value.getBytes(
                                                     StandardCharsets.UTF_8));
-            walManager.durableProduce(entry);
+            walWriter.append(entry);
             inMemoryCache.computeIfAbsent(partitionId, k -> new ArrayList<>())
                                          .add(entry);
             partitionOffsets.put(partitionId, offset + 1);
@@ -96,7 +98,7 @@ public class ProduceHandler extends MiniQueueApi {
         } catch (Exception e) {
             sendResponse(exchange, 500, "Internal Server Error: " + e.getMessage());
         } finally {
-            lock.unlock();
+            writeLock.unlock();
             ctx.stop();
         }
     }

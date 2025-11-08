@@ -10,7 +10,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.miniqueue.storage.EventStorage;
 import org.miniqueue.storage.Record;
 
@@ -18,14 +19,14 @@ import org.miniqueue.storage.Record;
  * Http Handler for Fetch command
  */
 public class FetchHandler extends MiniQueueApi {
-    private final Map<Short, ReentrantLock> partitionLocks;
+    private final Map<Short, ReadWriteLock> partitionLocks;
     private final EventStorage eventStorage;
     private final Map<Short, List<Record>> inMemoryCache;
     private final Counter fetchRequests;
     private final Timer timer;
 
     public FetchHandler(EventStorage eventStorage,
-                        Map<Short, ReentrantLock> partitionLocks,
+                        Map<Short, ReadWriteLock> partitionLocks,
                         Map<Short, List<Record>> inMemoryCache, MetricRegistry metrics) {
         this.partitionLocks = partitionLocks;
         this.eventStorage = eventStorage;
@@ -54,8 +55,9 @@ public class FetchHandler extends MiniQueueApi {
             return;
         }
         StringBuilder response = new StringBuilder();
-        final Lock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantLock());
-        lock.lock();
+        final ReadWriteLock lock = partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantReadWriteLock(true));
+        final Lock readLock = lock.readLock();
+        readLock.lock();
         try {
             List<Record> committedDataRecords = new ArrayList<>();
             committedDataRecords.addAll(
@@ -74,7 +76,7 @@ public class FetchHandler extends MiniQueueApi {
         } catch (Exception e) {
             sendResponse(exchange, 500, "Internal Server Error: " + e.getMessage());
         } finally {
-            lock.unlock();
+            readLock.unlock();
             ctx.stop();
         }
         sendResponse(exchange, 200, response.toString());

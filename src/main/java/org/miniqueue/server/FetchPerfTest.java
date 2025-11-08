@@ -22,8 +22,8 @@ import java.util.regex.Pattern;
 public class FetchPerfTest {
 
     private static final String SERVER_URL = "http://localhost:3000";
-    private static final int NUM_THREADS = 4;
-    private static final int FETCHES_PER_THREAD = 5_000;
+    private static final int NUM_THREADS = 10;
+    private static final int FETCHES_PER_THREAD = 2_000;
 
     private static final MetricRegistry METRICS = new MetricRegistry();
     private static final Histogram LATENCIES = METRICS.histogram("fetch-latencies");

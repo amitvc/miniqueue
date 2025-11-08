@@ -11,6 +11,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.codahale.metrics.Counter;
@@ -25,10 +28,8 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
     private int pageSize;
     private final AtomicLong nextAvailablePageNum;
 
-    // A single, global lock for all file modifications.
-    // fetch requires a read lock.
-    // flush requires a write lock.
-    private final ReentrantReadWriteLock fileLock = new ReentrantReadWriteLock();
+    // Partition-scoped locks so flush/fetch for different partitions can proceed independently.
+    private final Map<Short, ReentrantReadWriteLock> partitionLocks = new ConcurrentHashMap<>();
 
     /**
      * Opens (or creates) the data file and loads its header.
@@ -88,7 +89,8 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
      */
     @Override
     public List<Record> getRecordsByPartition(short partitionId) throws IOException {
-        fileLock.readLock().lock();
+        Lock readLock = getPartitionLock(partitionId).readLock();
+        readLock.lock();
         try {
             // 1. Get the list of ALL DataPage numbers for this partition
             List<Integer> dataPageNumbers = getAllDataPageNumbers(partitionId);
@@ -107,7 +109,7 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
             return records;
 
         } finally {
-            fileLock.readLock().unlock();
+            readLock.unlock();
         }
     }
 
@@ -134,20 +136,21 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
      * Flushes a batch of WAL entries to the data file.
      */
     public void flushWalEntries(Map<Short, List<Record>> groupedEntries, Counter flushCounter) throws IOException {
-        fileLock.writeLock().lock();
-        try {
-                // <partitionid, List<Record>//
-            for (Map.Entry<Short, List<Record>> batch : groupedEntries.entrySet()) {
-                short partitionId = batch.getKey();
-                List<Record> entries = batch.getValue();
+        for (Map.Entry<Short, List<Record>> batch : groupedEntries.entrySet()) {
+            short partitionId = batch.getKey();
+            List<Record> entries = batch.getValue();
 
-                if (entries.isEmpty()) continue;
+            if (entries.isEmpty()) {
+                continue;
+            }
 
+            Lock writeLock = getPartitionLock(partitionId).writeLock();
+            writeLock.lock();
+            try {
                 flushCounter.inc(entries.size());
                 // --- 1. Find the last MetaDataPage and last DataPage ---
                 // This is the most complex part. We must traverse the list.
                 int metadataPageForPartition = header.getMetadataPageForPartition(partitionId);
-                //int lastListPageNum = metadataPageForPartition;
                 MetaDataPage metaDataPage = MetaDataPage.deserialize(readPage(metadataPageForPartition));
 
                 // Iterate through metadata pages if we need to. Some partitions can grow large
@@ -156,7 +159,6 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
                     metadataPageForPartition = metaDataPage.getNextMetaDataPageNumber();
                     metaDataPage = MetaDataPage.deserialize(readPage(metadataPageForPartition));
                 }
-
 
                 DataPage lastDataPage = null;
                 int lastDataPageNum = metaDataPage.getLastPageNumber();
@@ -218,13 +220,12 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
                 }
                 // lastListPage is the (potentially new) last MetaDataPage
                 writePage(metadataPageForPartition, metaDataPage.serialize(pageSize));
+            } finally {
+                writeLock.unlock();
             }
-
-            dataChannel.force(true); // We want to force sync of metadata and bytes to the disk.
-
-        } finally {
-            fileLock.writeLock().unlock();
         }
+
+        dataChannel.force(true); // We want to force sync of metadata and bytes to the disk.
     }
 
 
@@ -254,16 +255,17 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
     }
 
     public Map<Short, List<Integer>> getAllocatedPages() throws IOException {
-        fileLock.readLock().lock();
-        try {
-            Map<Short, List<Integer>> partitionPages = new java.util.HashMap<>();
-            for (short i = 0; i < header.getMetadataPagesCount(); i++) {
+        Map<Short, List<Integer>> partitionPages = new java.util.HashMap<>();
+        for (short i = 0; i < header.getMetadataPagesCount(); i++) {
+            Lock readLock = getPartitionLock(i).readLock();
+            readLock.lock();
+            try {
                 partitionPages.put(i, getAllDataPageNumbers(i));
+            } finally {
+                readLock.unlock();
             }
-            return partitionPages;
-        } finally {
-            fileLock.readLock().unlock();
         }
+        return partitionPages;
     }
 
     /**
@@ -275,5 +277,9 @@ public class LocalDiskEventStorage implements AutoCloseable, EventStorage {
             dataChannel.force(true);
             dataChannel.close();
         }
+    }
+
+    private ReadWriteLock getPartitionLock(short partitionId) {
+        return partitionLocks.computeIfAbsent(partitionId, k -> new ReentrantReadWriteLock(true));
     }
 }

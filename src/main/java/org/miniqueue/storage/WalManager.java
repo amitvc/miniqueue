@@ -29,6 +29,7 @@ public class WalManager implements AutoCloseable {
 
     private long currentSegmentId;
     private FileChannel currentSegmentChannel;
+    private long currentSegmentSize;
 
     public WalManager(String walDirectoryPath, long maxSegmentSizeBytes) throws IOException {
         this.walDirectory = Paths.get(walDirectoryPath);
@@ -55,30 +56,42 @@ public class WalManager implements AutoCloseable {
                                                       StandardOpenOption.WRITE,
                                                       StandardOpenOption.CREATE,
                                                       StandardOpenOption.APPEND); // Append mode
+        currentSegmentSize = currentSegmentChannel.size();
     }
 
     public void durableProduce(WalRecord entry) throws IOException {
-        ByteBuffer payload = entry.serialize();
-        int payloadSize = payload.remaining();
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + payloadSize);
-        buffer.putInt(payloadSize);
-        buffer.put(payload);
-        buffer.flip();
-
         walLock.lock();
         try {
-            // Check if we need to roll over to a new segment
-            if (currentSegmentChannel.size() + buffer.remaining() > maxSegmentSizeBytes) {
-                currentSegmentId++;
-                openCurrentSegment();
-            }
-
-            // 1. Write to channel (OS buffer)
-            currentSegmentChannel.write(buffer);
-
-            // 2. Force to disk (DURABLE)
+            writeRecord(entry);
             currentSegmentChannel.force(false); // false = fdatasync (faster)
+        } finally {
+            walLock.unlock();
+        }
+    }
+
+    void appendBatch(List<WalRecord> entries, boolean forceAfterWrite) throws IOException {
+        if (entries == null || entries.isEmpty()) {
+            return;
+        }
+        walLock.lock();
+        try {
+            for (WalRecord entry : entries) {
+                writeRecord(entry);
+            }
+            if (forceAfterWrite) {
+                currentSegmentChannel.force(false);
+            }
+        } finally {
+            walLock.unlock();
+        }
+    }
+
+    void flushCurrentSegment() throws IOException {
+        walLock.lock();
+        try {
+            if (currentSegmentChannel != null) {
+                currentSegmentChannel.force(true);
+            }
         } finally {
             walLock.unlock();
         }
@@ -187,5 +200,29 @@ public class WalManager implements AutoCloseable {
         String name = path.getFileName().toString();
         String num = name.substring(12, 32); // "wal-segment-" and ".log"
         return Long.parseLong(num);
+    }
+
+    private void writeRecord(WalRecord entry) throws IOException {
+        ByteBuffer payload = entry.serialize();
+        int payloadSize = payload.remaining();
+
+        ByteBuffer buffer = ByteBuffer.allocate(4 + payloadSize);
+        buffer.putInt(payloadSize);
+        buffer.put(payload);
+        buffer.flip();
+
+        ensureCapacity(buffer.remaining());
+
+        while (buffer.hasRemaining()) {
+            currentSegmentChannel.write(buffer);
+        }
+        currentSegmentSize += (payloadSize + Integer.BYTES);
+    }
+
+    private void ensureCapacity(int bytesNeeded) throws IOException {
+        if (currentSegmentSize + bytesNeeded > maxSegmentSizeBytes) {
+            currentSegmentId++;
+            openCurrentSegment();
+        }
     }
 }

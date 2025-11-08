@@ -17,7 +17,9 @@ public class Config {
     public static final String DATA_FILE_NAME = "miniqueue.dat";
     public static final String SIGNATURE = "miniqueue";
     public static final String CHECKPOINT_FILE_PATH = "miniqueue.checkpoint";
-    public static final long FLUSH_INTERVAL_MS = 500;
-    public static final long COMPACTOR_INTERVAL_MS = 60_000;
-    public static final long MAX_WAL_SEGMENT_SIZE = 1024  * 1024; // 1 MB WAL Segments
+    public static final long FLUSH_INTERVAL_MS = 2000;
+    public static final long COMPACTOR_INTERVAL_MS = 10_000;
+    public static final long MAX_WAL_SEGMENT_SIZE = 5*1024  * 1024; // 5 MB WAL Segments
+    public static final int WAL_MAX_BATCH_SIZE = 64;
+    public static final long WAL_FLUSH_INTERVAL_MS = 5; // milliseconds
 }

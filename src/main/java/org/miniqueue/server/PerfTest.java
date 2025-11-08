@@ -31,7 +31,7 @@ public class PerfTest {
     private static final int NUM_THREADS = 10;
 
     // Total number of messages *each* thread will send
-    private static final int MESSAGES_PER_THREAD = 10000;
+    private static final int MESSAGES_PER_THREAD = 300000;
 
     // A small payload to make the test realistic
     private static final String PADDING = "a".repeat(60); // 100-byte padding
